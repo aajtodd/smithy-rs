@@ -3,21 +3,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{cmp, mem, ops::RangeInclusive, str::FromStr};
+use std::{cmp, collections::BinaryHeap, ops::RangeInclusive};
 
-use aws_sdk_s3::operation::get_object::{
-    builders::{GetObjectFluentBuilder, GetObjectInputBuilder},
-    GetObjectOutput,
-};
-use aws_smithy_types::{byte_stream::{AggregatedBytes, ByteStream}, body::SdkBody};
+use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
 use aws_types::SdkConfig;
 use bytes::Buf;
-use tokio::{io::AsyncWrite, sync::mpsc};
+use tokio::{
+    io::{AsyncWrite, AsyncWriteExt},
+    sync::mpsc,
+};
 
 use crate::{
-    header::{ByteRange, Range},
+    discovery::{discover_obj_size, DiscoverResult},
+    error::{self, TransferError},
+    header::Range,
     object_meta::ObjectResponseMeta,
-    DownloadError, TransferError, MEBI_BYTE, MIN_PART_SIZE,
+    types::{ChunkRequest, ChunkResponse, DownloadHandle, DownloadRequest, DownloadResponse},
+    MEBI_BYTE, MIN_PART_SIZE,
 };
 
 // FIXME - SEP specifies this should be a config option but I'm not seeing a compelling reason why
@@ -99,25 +101,6 @@ impl From<Builder> for Downloader {
     }
 }
 
-// TODO - builders + convenience conversions for request/response types
-
-pub struct DownloadRequest {
-    inner: GetObjectInputBuilder,
-}
-
-// FIXME - should probably be TryFrom since checksums may conflict?
-impl From<GetObjectFluentBuilder> for DownloadRequest {
-    fn from(value: GetObjectFluentBuilder) -> Self {
-        Self {
-            inner: value.as_input().clone(),
-        }
-    }
-}
-
-pub struct DownloadResponse {
-    inner: ObjectResponseMeta,
-}
-
 // TODO - we may want to hide this type behind a higher level "TransferManager" type and construct
 // the client there
 
@@ -148,247 +131,211 @@ impl Downloader {
     //
     // TODO(design): SEP says to provide progress
 
-    pub async fn download<T: AsyncWrite>(
+    pub async fn download<T: AsyncWrite + Unpin>(
         &self,
-        dest: T,
+        dest: &mut T,
         request: DownloadRequest,
     ) -> Result<DownloadResponse, TransferError> {
         // if there is a part number then just send the default request
         if request.inner.get_part_number().is_some() {
             // let llr = request.get_object_request.send();
-            // let _llr = request.inner.send_with(&self.client).await.map_err(|e| DownloadError::ChunkFailed { source: e.into() })?;
             todo!("single part download not implemented");
         }
 
-        // make initial discovery about the object size, metadata, possibly first chunk
-        let discovery = self.discover_obj_size(&request).await?;
-
-        let (tx, rx) = mpsc::channel(self.concurrency);
-        if let Some(chunk) = discovery.initial_chunk {
-            // ensure initial chunk is written
-            tx.send(chunk).await.expect("receiver open");
-        }
-
-        let mut handles = Vec::new();
-        if discovery.remaining.is_empty() {
-            drop(tx);
-        }else {
-            // TODO start seeding work
-
-            for _ in 0..self.concurrency {
-                let worker = download_worker(tx.clone());
-                let handle = tokio::spawn(async move {
-                    worker.await
-                });
-
-                handles.push(handle);
-            }
-        }
-
-        recv_chunks(dest, &request, rx).await;
-
-        todo!("not implemented");
-    }
-
-    async fn discover_obj_size(
-        &self,
-        request: &DownloadRequest,
-    ) -> Result<DiscoverResult, TransferError> {
-        let strategy = DiscoverObjectSizeStrategy::from_request(&request)?;
-        match strategy {
-            DiscoverObjectSizeStrategy::HeadObject => {
-                self.discover_obj_size_with_head(&request).await
-            }
-            DiscoverObjectSizeStrategy::FirstPart => {
-                let r = request.inner.clone().part_number(1);
-                return self.discover_obj_size_with_get(r).await;
-            }
-            DiscoverObjectSizeStrategy::RangedGet => {
-                let r = request
-                    .inner
-                    .clone()
-                    .set_part_number(None)
-                    .range(Range::bytes(ByteRange::Inclusive(
-                        0,
-                        self.target_part_size_bytes,
-                    )));
-
-                return self.discover_obj_size_with_get(r).await;
-            }
-            DiscoverObjectSizeStrategy::RangeGiven(range) => Ok(DiscoverResult {
-                remaining: range,
-                object_meta: None,
-                initial_chunk: None,
-            }),
-        }
-    }
-
-    async fn discover_obj_size_with_head(
-        &self,
-        request: &DownloadRequest,
-    ) -> Result<DiscoverResult, TransferError> {
-        let meta: ObjectResponseMeta = self
-            .client
-            .head_object()
-            .set_bucket(request.inner.get_bucket().clone())
-            .set_key(request.inner.get_key().clone())
-            .send()
-            .await
-            .map_err(|e| DownloadError::DiscoverFailed(e.into()))?
-            .into();
-
-        let remaining = 0..=meta.total_size();
-        Ok(DiscoverResult {
-            remaining,
-            object_meta: Some(meta),
-            initial_chunk: None,
-        })
-    }
-
-    async fn discover_obj_size_with_get(
-        &self,
-        request: GetObjectInputBuilder,
-    ) -> Result<DiscoverResult, TransferError> {
-        let resp = request.send_with(&self.client).await;
-
-        if resp.is_err() {
-            // TODO - deal with empty file errors, see https://github.com/awslabs/aws-c-s3/blob/v0.5.7/source/s3_auto_ranged_get.c#L147-L153
-        }
-
-        let mut resp = resp.map_err(|e| DownloadError::DiscoverFailed(e.into()))?;
-        let empty_stream = ByteStream::new(SdkBody::empty());
-        let body = mem::replace(&mut resp.body, empty_stream);
-
-        let data = body
-            .collect()
-            .await
-            .map_err(|e| DownloadError::DiscoverFailed(e.into()))?;
-
-        let meta: ObjectResponseMeta = resp.into();
-        let remaining = (data.remaining() as u64 + 1) ..=meta.total_size();
-
-        Ok(DiscoverResult {
-            remaining,
-            object_meta: Some(meta),
-
-            // FIXME - make initial chunk
-            initial_chunk: None,
-        })
-    }
-}
-
-struct DiscoverResult {
-    // range of data remaining
-    remaining: RangeInclusive<u64>,
-    // the discovered metadata (may be none if we didn't execute a request)
-    object_meta: Option<ObjectResponseMeta>,
-    initial_chunk: Option<ChunkResponse>,
-}
-
-enum DiscoverObjectSizeStrategy {
-    // Send a `HeadObject` request to discover the object size
-    HeadObject,
-    // Send `GetObject` with `part_number` = 1
-    FirstPart,
-    // Send `GetObject` for range [0, part_size]
-    RangedGet,
-    // Range given in request, we don't need to know the object size
-    RangeGiven(RangeInclusive<u64>),
-}
-
-impl DiscoverObjectSizeStrategy {
-    fn from_request(
-        request: &DownloadRequest,
-    ) -> Result<DiscoverObjectSizeStrategy, TransferError> {
-        let strategy = match request.inner.get_range() {
-            Some(h) => match Range::from_str(h)?.0 {
-                ByteRange::Inclusive(start, end) => {
-                    DiscoverObjectSizeStrategy::RangeGiven(start..=end)
-                }
-                // TODO: explore when given a start range what it would look like to just start
-                // sending requests from [start, start+part_size].
-                _ => DiscoverObjectSizeStrategy::HeadObject,
-            },
-            None => DiscoverObjectSizeStrategy::RangedGet,
+        let handle = DownloadHandle {
+            client: self.client.clone(),
+            target_part_size: self.target_part_size_bytes,
         };
 
-        Ok(strategy)
+        // make initial discovery about the object size, metadata, possibly first chunk
+        let mut discovery = discover_obj_size(&handle, &request).await?;
+
+        let (comp_tx, comp_rx) = mpsc::channel(self.concurrency);
+
+        if let Some(data) = discovery.initial_chunk_data.take() {
+            // ensure initial chunk is written
+            let chunk = ChunkResponse {
+                seq: 0,
+                data: Some(data),
+                object_meta: discovery.object_meta.clone(),
+            };
+            comp_tx.send(Ok(chunk)).await.expect("channel empty");
+        }
+
+        if discovery.remaining.is_empty() {
+            // discovery fetched all the payload
+            drop(comp_tx);
+        } else {
+            // start assigning work
+            let (work_tx, work_rx) = async_channel::bounded(self.concurrency);
+            let input = request.inner.clone();
+            let part_size = self.target_part_size_bytes;
+
+            // FIXME - I think we'll need to cancel/abort some of these tasks on failures
+            tokio::spawn(distribute_work(discovery, input, part_size, work_tx));
+
+            // spin up workers
+            for _ in 0..self.concurrency {
+                let worker = chunk_downloader(handle.clone(), work_rx.clone(), comp_tx.clone());
+                tokio::spawn(worker);
+            }
+        }
+
+        // should block until all work has completed
+        let resp = recv_chunks(dest, comp_rx).await;
+        if resp.is_err() {
+            todo!("handle cancelling tasks spawned")
+        }
+
+        resp
     }
-}
-
-// TODO - switch to enum for chunk vs part
-#[derive(Debug, Clone)]
-struct ChunkRequest {
-    // byte range to download
-    range: RangeInclusive<u64>,
-
-    // TODO - explore pooled buffers
-    // buf: BytesMut,
-
-    // sequence number
-    seq: u64,
-}
-
-#[derive(Debug, Clone)]
-struct ChunkResponse {
-    // the request for this chunk
-    request: ChunkRequest,
-
-    // chunk data
-    data: AggregatedBytes,
-
-    // sequence number
-    seq: u64,
 }
 
 /// Process chunks off the channel and write them to dest in sequence
-async fn recv_chunks<T: AsyncWrite>(
-    dest: T,
-    request: &DownloadRequest,
-    mut chunks: mpsc::Receiver<ChunkResponse>,
-) -> Result<(), TransferError> {
-    while let Some(chunk) = chunks.recv().await {}
+async fn recv_chunks<T: AsyncWrite + Unpin>(
+    dest: &mut T,
+    mut chunks: mpsc::Receiver<Result<ChunkResponse, TransferError>>,
+) -> Result<DownloadResponse, TransferError> {
 
-    // TODO - response type
-    Ok(())
+    let mut response = DownloadResponse::builder();
+    let mut sequencer = Sequencer::new(0);
+
+    while let Some(chunk) = chunks.recv().await {
+        match chunk {
+            Ok(chunk_resp) => sequencer.push(chunk_resp),
+            Err(err) => return Err(err),
+        }
+
+        // FIXME - drain as much as possible
+       
+        if matches!(sequencer.peek(), Some(chunk) if chunk.seq == next_seq) {
+            let chunk_resp = sequencer.pop().expect("matched already");
+
+            // initial response metadata may not have been set if we didn't do a `GetObject` for the first chunk
+            response.object_metadata(chunk_resp.object_meta);
+            if let Some(mut data) = chunk_resp.data {
+                // TODO - vectored write
+                while data.has_remaining() {
+                    dest.write_buf(&mut data)
+                        .await
+                        .map_err(error::chunk_failed)?;
+                }
+            }
+        }
+    }
+
+    // all chunks received, drain any remaining
+    if !sequencer.is_empty() {
+    }
+
+    Ok(response.build())
 }
 
-async fn download_worker(completed: mpsc::Sender<ChunkResponse>) {
+
+struct Sequencer {
+    // TODO - explore other collections
+    responses: BinaryHeap<ChunkResponse>,
+    next_seq: u64,
 }
 
-/*
+impl Sequencer {
+    fn new(next_seq: u64) -> Self {
+        Self {
+            responses: BinaryHeap::new(),
+            next_seq
+        }
+    }
 
-Need async-channel apparently?
+    fn push(&mut self, chunk: ChunkResponse) {
+        self.responses.push(chunk);
+    }
 
-Structural:
-1. spin up worker to receive chunks
-2. spin up concurrent workers that pull off a queue/channel for work and do the download for a single chunk
+    fn is_empty(&self) -> bool {
+        self.responses.is_empty()
+    }
 
+    fn pop(&mut self) -> Option<ChunkResponse> {
+        self.responses.pop()
+    }
 
-async fn recvChunks(writer, concurrency, channel<ChunkRequest>) -> ?? {
-    // process chunks off the channel and write them
+    fn peek(&self) -> Option<&ChunkResponse> {
+        self.responses.peek()
+    }
+
 }
 
+// Worker function that processes requests from the `requests` channel and
+// sends the result back on the `completed` channel.
+async fn chunk_downloader(
+    handle: DownloadHandle,
+    requests: async_channel::Receiver<ChunkRequest>,
+    completed: mpsc::Sender<Result<ChunkResponse, TransferError>>,
+) {
+    while let Ok(request) = requests.recv().await {
+        let result = download_chunk(&handle, request).await;
+        if let Err(err) = completed.send(result).await {
+            tracing::debug!(error = ?err, "chunk worker send failed");
+            return;
+        }
+    }
+}
 
-pub async fn download(&self, request: DownloadRequest) -> Result<DownloadResponse, TransferError>
+async fn download_chunk(
+    handle: &DownloadHandle,
+    request: ChunkRequest,
+) -> Result<ChunkResponse, TransferError> {
+    let resp = request
+        .input
+        .send_with(&handle.client)
+        .await
+        .map_err(error::chunk_failed)?;
 
-#[cfg(all(feature = "rt-tokio", not(target_family = "wasm")))]
+    let bytes = resp.body.collect().await.map_err(error::chunk_failed)?;
 
-pub async fn download(&self, request: DownloadRequest, sink: AsyncWrite) -> Result<?, TransferError>
+    let resp = ChunkResponse {
+        seq: request.seq,
+        data: Some(bytes),
+        // FIXME - set meta
+        object_meta: None,
+    };
 
-// when we do a ranged get on an object with a size greater than the part length:
-    content_length: Some(
-        5242881,
-    ),
-    content_range: Some(
-        "bytes 0-5242880/1073741824",
-    ),
+    Ok(resp)
+}
 
-// when we do a ranged get on an object with a size less than or equal part length:
-   content_length: Some(
-        2097152,
-    ),
-    content_range: Some(
-        "bytes 0-2097151/2097152",
-    ),
- */
+async fn distribute_work(
+    discovery: DiscoverResult,
+    input: GetObjectInputBuilder,
+    part_size: u64,
+    tx: async_channel::Sender<ChunkRequest>,
+) {
+    let end = *discovery.remaining.end();
+    let mut pos = *discovery.remaining.start();
+    let mut remaining = end - pos;
+
+    // NOTE: start at 1 in case there was an initial chunk in discovery
+    let mut seq = 1;
+
+    while remaining > 0 {
+        let start = pos;
+        let end_inclusive = cmp::min(pos + part_size, end);
+
+        let chunk_req = next_chunk(start, end_inclusive, seq, input.clone());
+        let chunk_size = chunk_req.size();
+        tx.send(chunk_req).await.expect("channel open");
+
+        seq += 1;
+        remaining -= chunk_size;
+        pos += chunk_size;
+    }
+}
+
+fn next_chunk(
+    start: u64,
+    end_inclusive: u64,
+    seq: u64,
+    input: GetObjectInputBuilder,
+) -> ChunkRequest {
+    let range = start..=end_inclusive;
+    let input = input.range(Range::bytes_inclusive(start, end_inclusive));
+    ChunkRequest { seq, range, input }
+}

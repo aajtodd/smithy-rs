@@ -1,7 +1,7 @@
 use core::fmt;
 use std::str::FromStr;
 
-use crate::TransferError;
+use crate::error::TransferError;
 
 /// Representation of `Range` header.
 /// NOTE: S3 only supports a single bytes range this is a simplified representation
@@ -11,6 +11,10 @@ pub(crate) struct Range(pub(crate) ByteRange);
 impl Range {
     pub(crate) fn bytes(rng: ByteRange) -> Self {
         Self(rng)
+    }
+
+    pub(crate) fn bytes_inclusive(start: u64, end: u64) -> Self {
+        Range::bytes(ByteRange::Inclusive(start, end))
     }
 }
 
@@ -99,7 +103,7 @@ impl FromStr for ByteRange {
 
 #[cfg(test)]
 mod tests {
-    use crate::{header::Range, TransferError};
+    use crate::{header::Range, error::TransferError};
 
     use super::ByteRange;
     use std::str::FromStr;
@@ -126,7 +130,7 @@ mod tests {
             TransferError::InvalidMetaRequest(m) => {
                 assert!(m.contains(msg), "'{}' does not contain '{}'", m, msg);
             }
-            _ => panic!("unexpected error type")
+            _ => panic!("unexpected error type"),
         }
     }
 

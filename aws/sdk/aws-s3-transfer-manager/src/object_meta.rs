@@ -1,6 +1,7 @@
 use aws_sdk_s3::operation::{get_object::GetObjectOutput, head_object::HeadObjectOutput};
 
 // Object metadata other than the body that can be set from either `GetObject` or `HeadObject`
+#[derive(Debug, Clone)]
 pub(crate) struct ObjectResponseMeta {
     pub(crate) delete_marker: Option<bool>,
     pub(crate) accept_ranges: Option<String>,
@@ -40,10 +41,11 @@ pub(crate) struct ObjectResponseMeta {
 }
 
 impl ObjectResponseMeta {
+    /// The total object size
     pub(crate) fn total_size(&self) -> u64 {
-        match (self.content_length, self.content_range) {
+        match (self.content_length, self.content_range.as_ref()) {
             (_, Some(range)) => {
-                let total = range.splitn(2, '/').skip(1).next().expect("content range total");
+                let total = range.split_once('/').map(|x| x.1).expect("content range total");
                 total.parse().expect("valid range total")
             }
             (Some(length), None) => length as u64,
