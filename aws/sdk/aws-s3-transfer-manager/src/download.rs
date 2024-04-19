@@ -196,8 +196,9 @@ async fn recv_chunks<T: AsyncWrite + Unpin>(
     dest: &mut T,
     mut chunks: mpsc::Receiver<Result<ChunkResponse, TransferError>>,
 ) -> Result<DownloadResponse, TransferError> {
-
     let mut response = DownloadResponse::builder();
+
+    // FIXME - need to get the correct start number
     let mut sequencer = Sequencer::new(0);
 
     while let Some(chunk) = chunks.recv().await {
@@ -206,32 +207,23 @@ async fn recv_chunks<T: AsyncWrite + Unpin>(
             Err(err) => return Err(err),
         }
 
-        // FIXME - drain as much as possible
-       
-        if matches!(sequencer.peek(), Some(chunk) if chunk.seq == next_seq) {
-            let chunk_resp = sequencer.pop().expect("matched already");
 
-            // initial response metadata may not have been set if we didn't do a `GetObject` for the first chunk
-            response.object_metadata(chunk_resp.object_meta);
-            if let Some(mut data) = chunk_resp.data {
-                // TODO - vectored write
-                while data.has_remaining() {
-                    dest.write_buf(&mut data)
-                        .await
-                        .map_err(error::chunk_failed)?;
-                }
-            }
-        }
+        // FIXME - need to set initial resp meta
+        // initial response metadata may not have been set if we didn't do a `GetObject` for the first chunk
+        // response.object_metadata(chunk_resp.object_meta);
+        
+        // drain as much as possible
+        sequencer.write_available(dest).await?;
     }
 
     // all chunks received, drain any remaining
-    if !sequencer.is_empty() {
-    }
+    if !sequencer.is_empty() {}
 
     Ok(response.build())
 }
 
-
+// Sequencer maintains the correct chunk ordering. Chunks are downloaded concurrently
+// and may not complete in the order they need to be written in.
 struct Sequencer {
     // TODO - explore other collections
     responses: BinaryHeap<ChunkResponse>,
@@ -242,7 +234,7 @@ impl Sequencer {
     fn new(next_seq: u64) -> Self {
         Self {
             responses: BinaryHeap::new(),
-            next_seq
+            next_seq,
         }
     }
 
@@ -262,6 +254,29 @@ impl Sequencer {
         self.responses.peek()
     }
 
+    async fn write_available<T: AsyncWrite + Unpin>(
+        &mut self,
+        dest: &mut T,
+    ) -> Result<usize, TransferError> {
+        let mut wc = 0;
+        // TODO - vectored write, gather as many chunks as possible to write out
+        while matches!(self.peek(), Some(chunk) if chunk.seq == self.next_seq) {
+            let chunk_resp = self.pop().expect("matched already");
+
+            if let Some(mut data) = chunk_resp.data {
+                while data.has_remaining() {
+                    wc += dest
+                        .write_buf(&mut data)
+                        .await
+                        .map_err(error::chunk_failed)?;
+                }
+            }
+            // FIXME - need to set seq to use in main function
+            self.next_seq += 1;
+        }
+
+        Ok(wc)
+    }
 }
 
 // Worker function that processes requests from the `requests` channel and

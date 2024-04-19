@@ -8,9 +8,10 @@ use aws_smithy_types::{
 use bytes::Buf;
 
 use crate::{
+    error::{DownloadError, TransferError},
     header::{ByteRange, Range},
     object_meta::ObjectResponseMeta,
-    types::{DownloadHandle, DownloadRequest}, error::{DownloadError, TransferError},
+    types::{DownloadHandle, DownloadRequest},
 };
 
 /// Result of initial object discovery
@@ -20,12 +21,14 @@ pub(crate) struct DiscoverResult {
     pub(crate) remaining: RangeInclusive<u64>,
     // the discovered metadata (may be none if we didn't execute a request)
     pub(crate) object_meta: Option<ObjectResponseMeta>,
+    // the first chunk of data if discovery involved `GetObject` for first part/range
     pub(crate) initial_chunk_data: Option<AggregatedBytes>,
 }
 
 enum DiscoverObjectSizeStrategy {
-    // Send a `HeadObject` request to discover the object size
-    HeadObject,
+    // Send a `HeadObject` request to discover the object size,
+    // optionally constrained tp the given range
+    HeadObject(Option<ByteRange>),
     // Send `GetObject` with `part_number` = 1
     FirstPart,
     // Send `GetObject` for range [0, part_size]
@@ -39,14 +42,17 @@ impl DiscoverObjectSizeStrategy {
         request: &DownloadRequest,
     ) -> Result<DiscoverObjectSizeStrategy, TransferError> {
         let strategy = match request.inner.get_range() {
-            Some(h) => match Range::from_str(h)?.0 {
-                ByteRange::Inclusive(start, end) => {
-                    DiscoverObjectSizeStrategy::RangeGiven(start..=end)
+            Some(h) => {
+                let byte_range = Range::from_str(h)?.0;
+                match byte_range {
+                    ByteRange::Inclusive(start, end) => {
+                        DiscoverObjectSizeStrategy::RangeGiven(start..=end)
+                    }
+                    // TODO: explore when given a start range what it would look like to just start
+                    // sending requests from [start, start+part_size].
+                    _ => DiscoverObjectSizeStrategy::HeadObject(Some(byte_range)),
                 }
-                // TODO: explore when given a start range what it would look like to just start
-                // sending requests from [start, start+part_size].
-                _ => DiscoverObjectSizeStrategy::HeadObject,
-            },
+            }
             None => DiscoverObjectSizeStrategy::RangedGet,
         };
 
@@ -61,9 +67,8 @@ pub(crate) async fn discover_obj_size(
 ) -> Result<DiscoverResult, TransferError> {
     let strategy = DiscoverObjectSizeStrategy::from_request(request)?;
     match strategy {
-        DiscoverObjectSizeStrategy::HeadObject => {
-            // FIXME - need to retain original range
-            discover_obj_size_with_head(handle, request).await
+        DiscoverObjectSizeStrategy::HeadObject(byte_range) => {
+            discover_obj_size_with_head(handle, request, byte_range).await
         }
         DiscoverObjectSizeStrategy::FirstPart => {
             let r = request.inner.clone().part_number(1);
@@ -92,6 +97,7 @@ pub(crate) async fn discover_obj_size(
 async fn discover_obj_size_with_head(
     handle: &DownloadHandle,
     request: &DownloadRequest,
+    byte_range: Option<ByteRange>,
 ) -> Result<DiscoverResult, TransferError> {
     let meta: ObjectResponseMeta = handle
         .client
@@ -103,7 +109,15 @@ async fn discover_obj_size_with_head(
         .map_err(|e| DownloadError::DiscoverFailed(e.into()))?
         .into();
 
-    let remaining = 0..=meta.total_size();
+    let remaining = match byte_range {
+        Some(range) => match range {
+            ByteRange::Inclusive(start, end) => start..=end,
+            ByteRange::AllFrom(start) => start..=meta.total_size(),
+            ByteRange::Last(n) => (meta.total_size() - n + 1)..=meta.total_size()
+        }
+        None =>  0..=meta.total_size(),
+    };
+
     Ok(DiscoverResult {
         remaining,
         object_meta: Some(meta),

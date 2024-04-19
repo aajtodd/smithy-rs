@@ -1,4 +1,4 @@
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, sync::atomic::AtomicU64};
 
 use aws_sdk_s3::operation::get_object::builders::{GetObjectInputBuilder, GetObjectFluentBuilder};
 use aws_smithy_types::byte_stream::AggregatedBytes;
