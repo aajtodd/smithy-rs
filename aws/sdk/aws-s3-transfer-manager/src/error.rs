@@ -1,6 +1,5 @@
 use aws_smithy_types::byte_stream;
-use std::io;
-use std::ops::RangeInclusive;
+use std::{ops::RangeInclusive, io};
 
 #[derive(thiserror::Error, Debug)]
 pub enum TransferError {

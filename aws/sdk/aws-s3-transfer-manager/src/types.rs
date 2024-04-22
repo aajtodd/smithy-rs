@@ -1,4 +1,4 @@
-use std::{ops::RangeInclusive, sync::atomic::AtomicU64};
+use std::{ops::RangeInclusive};
 
 use aws_sdk_s3::operation::get_object::builders::{GetObjectInputBuilder, GetObjectFluentBuilder};
 use aws_smithy_types::byte_stream::AggregatedBytes;
@@ -18,9 +18,18 @@ impl From<GetObjectFluentBuilder> for DownloadRequest {
     }
 }
 
+impl From<GetObjectInputBuilder> for DownloadRequest {
+    fn from(value: GetObjectInputBuilder) -> Self {
+        Self {
+            inner: value
+        }
+    }
+}
+
 // FIXME - expose common fields?
 pub struct DownloadResponse {
-    pub(crate) inner: Option<ObjectResponseMeta>,
+    /// Object metadata
+    pub object_meta: ObjectResponseMeta,
 }
 
 impl DownloadResponse {
@@ -46,8 +55,13 @@ impl DownloadResponseBuilder {
     }
 
     pub(crate) fn build(self) -> DownloadResponse {
+        // FIXME - object metadata needs corrected since chunks have Content-Length set to chunk size
+        // which isn't the same as the total size. Probably should sanitize other fields like
+        // range.
+        let mut meta = self.inner.expect("response metadata set");
+        meta.content_length = Some(meta.total_size() as i64);
         DownloadResponse {
-            inner: self.inner
+            object_meta: meta
         }
     }
 }
@@ -57,6 +71,28 @@ pub(crate) struct DownloadHandle {
     pub(crate) client: aws_sdk_s3::Client,
     pub(crate) target_part_size: u64,
 }
+
+// #[derive(Debug, Clone)]
+// pub(crate) struct SharedDownloadHandle(Arc<DownloadHandle>);
+//
+// impl SharedDownloadHandle {
+//     fn client(&self) -> &aws_sdk_s3::Client {
+//         &self.0.client
+//     }
+//
+//     fn target_part_size(&self) -> u64 {
+//         self.0.target_part_size
+//     }
+//
+//     fn input(&self) -> &GetObjectInputBuilder {
+//         &self.0.input
+//     }
+//
+//     fn set_response_meta(&self, meta: Option<ObjectResponseMeta>) {
+//         let mut g = self.0.response.lock().unwrap();
+//         *g = meta;
+//     }
+// }
 
 
 // FIXME - should probably be enum ChunkRequest { Range(..), Part(..) } or have an inner field like such
@@ -85,6 +121,7 @@ pub(crate) struct ChunkResponse {
     pub(crate) seq: u64,
     // chunk data
     pub(crate) data: Option<AggregatedBytes>,
+    // object metadata
     pub(crate) object_meta: Option<ObjectResponseMeta>
 }
 

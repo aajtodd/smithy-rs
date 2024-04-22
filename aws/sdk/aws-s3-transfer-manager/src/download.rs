@@ -6,6 +6,7 @@
 use std::{cmp, collections::BinaryHeap, ops::RangeInclusive};
 
 use aws_sdk_s3::operation::get_object::builders::GetObjectInputBuilder;
+use aws_smithy_types::byte_stream::AggregatedBytes;
 use aws_types::SdkConfig;
 use bytes::Buf;
 use tokio::{
@@ -17,7 +18,6 @@ use crate::{
     discovery::{discover_obj_size, DiscoverResult},
     error::{self, TransferError},
     header::Range,
-    object_meta::ObjectResponseMeta,
     types::{ChunkRequest, ChunkResponse, DownloadHandle, DownloadRequest, DownloadResponse},
     MEBI_BYTE, MIN_PART_SIZE,
 };
@@ -131,6 +131,9 @@ impl Downloader {
     //
     // TODO(design): SEP says to provide progress
 
+    // TODO(design): this should probably be part of a higher level TM type that passes in (e.g.)
+    // transfer_id, progress callbacks, etc.
+
     pub async fn download<T: AsyncWrite + Unpin>(
         &self,
         dest: &mut T,
@@ -142,37 +145,26 @@ impl Downloader {
             todo!("single part download not implemented");
         }
 
+        // FIXME - adjust target_part_size based on total transfer size + ocncurrency settings for optimaml transfer
         let handle = DownloadHandle {
             client: self.client.clone(),
             target_part_size: self.target_part_size_bytes,
         };
 
         // make initial discovery about the object size, metadata, possibly first chunk
-        let mut discovery = discover_obj_size(&handle, &request).await?;
+        let discovery = discover_obj_size(&handle, &request).await?;
 
         let (comp_tx, comp_rx) = mpsc::channel(self.concurrency);
 
-        if let Some(data) = discovery.initial_chunk_data.take() {
-            // ensure initial chunk is written
-            let chunk = ChunkResponse {
-                seq: 0,
-                data: Some(data),
-                object_meta: discovery.object_meta.clone(),
-            };
-            comp_tx.send(Ok(chunk)).await.expect("channel empty");
-        }
-
-        if discovery.remaining.is_empty() {
-            // discovery fetched all the payload
-            drop(comp_tx);
-        } else {
+        if !discovery.remaining.is_empty() {
             // start assigning work
             let (work_tx, work_rx) = async_channel::bounded(self.concurrency);
             let input = request.inner.clone();
             let part_size = self.target_part_size_bytes;
+            let rem = discovery.remaining.clone();
 
             // FIXME - I think we'll need to cancel/abort some of these tasks on failures
-            tokio::spawn(distribute_work(discovery, input, part_size, work_tx));
+            tokio::spawn(distribute_work(rem, input, part_size, work_tx));
 
             // spin up workers
             for _ in 0..self.concurrency {
@@ -181,8 +173,10 @@ impl Downloader {
             }
         }
 
+        drop(comp_tx);
+
         // should block until all work has completed
-        let resp = recv_chunks(dest, comp_rx).await;
+        let resp = recv_chunks(dest, discovery, comp_rx).await;
         if resp.is_err() {
             todo!("handle cancelling tasks spawned")
         }
@@ -194,30 +188,44 @@ impl Downloader {
 /// Process chunks off the channel and write them to dest in sequence
 async fn recv_chunks<T: AsyncWrite + Unpin>(
     dest: &mut T,
+    discovery: DiscoverResult,
     mut chunks: mpsc::Receiver<Result<ChunkResponse, TransferError>>,
 ) -> Result<DownloadResponse, TransferError> {
     let mut response = DownloadResponse::builder();
+    // set obj metadata from discovery if available
+    response.object_metadata(discovery.object_meta);
 
-    // FIXME - need to get the correct start number
-    let mut sequencer = Sequencer::new(0);
+    // write initial chunk from discovery if available
+    if let Some(data) = discovery.initial_chunk_data {
+        tracing::trace!("initial discovery chunk written");
+        write_chunk(dest, data).await?;
+    }
 
+    // NOTE: expectd sequence always starts at 0, initial chunk is handled without a sequence already
+    let mut sequencer = Sequencer::new();
+
+    // TODO - explore draining many chunks until we would block before attempting write
     while let Some(chunk) = chunks.recv().await {
         match chunk {
-            Ok(chunk_resp) => sequencer.push(chunk_resp),
+            Ok(chunk_resp) => {
+                tracing::trace!("received chunk; seq={}", chunk_resp.seq);
+                sequencer.push(chunk_resp);
+            }
             Err(err) => return Err(err),
         }
-
 
         // FIXME - need to set initial resp meta
         // initial response metadata may not have been set if we didn't do a `GetObject` for the first chunk
         // response.object_metadata(chunk_resp.object_meta);
-        
+
         // drain as much as possible
-        sequencer.write_available(dest).await?;
+        let wc = write_available(&mut sequencer, dest).await?;
+        tracing::trace!("wrote {} bytes", wc);
     }
 
+    tracing::trace!("all chunks received, writing remaining");
     // all chunks received, drain any remaining
-    if !sequencer.is_empty() {}
+    write_remaining(&mut sequencer, dest).await?;
 
     Ok(response.build())
 }
@@ -226,57 +234,89 @@ async fn recv_chunks<T: AsyncWrite + Unpin>(
 // and may not complete in the order they need to be written in.
 struct Sequencer {
     // TODO - explore other collections
-    responses: BinaryHeap<ChunkResponse>,
+    // chunks sorted by seq
+    responses: BinaryHeap<cmp::Reverse<ChunkResponse>>,
+    // next expected seq to write
     next_seq: u64,
 }
 
 impl Sequencer {
-    fn new(next_seq: u64) -> Self {
+    fn new() -> Self {
         Self {
             responses: BinaryHeap::new(),
-            next_seq,
+            next_seq: 0,
         }
     }
 
     fn push(&mut self, chunk: ChunkResponse) {
-        self.responses.push(chunk);
-    }
-
-    fn is_empty(&self) -> bool {
-        self.responses.is_empty()
+        self.responses.push(cmp::Reverse(chunk));
     }
 
     fn pop(&mut self) -> Option<ChunkResponse> {
-        self.responses.pop()
+        self.responses.pop().map(|r| r.0)
     }
 
     fn peek(&self) -> Option<&ChunkResponse> {
-        self.responses.peek()
+        self.responses.peek().map(|r| &r.0)
     }
 
-    async fn write_available<T: AsyncWrite + Unpin>(
-        &mut self,
-        dest: &mut T,
-    ) -> Result<usize, TransferError> {
-        let mut wc = 0;
-        // TODO - vectored write, gather as many chunks as possible to write out
-        while matches!(self.peek(), Some(chunk) if chunk.seq == self.next_seq) {
-            let chunk_resp = self.pop().expect("matched already");
+    fn advance(&mut self) {
+        self.next_seq += 1;
+    }
+}
 
-            if let Some(mut data) = chunk_resp.data {
-                while data.has_remaining() {
-                    wc += dest
-                        .write_buf(&mut data)
-                        .await
-                        .map_err(error::chunk_failed)?;
-                }
-            }
-            // FIXME - need to set seq to use in main function
-            self.next_seq += 1;
+// Write as many sequences as currently possible
+async fn write_available<T: AsyncWrite + Unpin>(
+    sequencer: &mut Sequencer,
+    dest: &mut T,
+) -> Result<usize, TransferError> {
+    let mut wc = 0;
+    let mut cnt = 0;
+    // TODO - vectored write, gather as many chunks as possible to write out
+    while matches!(sequencer.peek(), Some(chunk) if chunk.seq == sequencer.next_seq) {
+        let chunk_resp = sequencer.pop().expect("matched already");
+        if let Some(data) = chunk_resp.data {
+            wc += write_chunk(dest, data).await?;
         }
-
-        Ok(wc)
+        cnt += 1;
+        sequencer.advance();
     }
+
+    tracing::trace!("processed {} chunks", cnt);
+
+    Ok(wc)
+}
+
+// Drain all remaining sequences. This assumes no more sequences are coming
+// and that all remainng sequences are in the correct order.
+async fn write_remaining<T: AsyncWrite + Unpin>(
+    sequencer: &mut Sequencer,
+    dest: &mut T,
+) -> Result<usize, TransferError> {
+    let mut wc = 0;
+    while let Some(chunk_resp) = sequencer.pop() {
+        debug_assert!(chunk_resp.seq == sequencer.next_seq, "chunk seq={}; next expected={}", chunk_resp.seq, sequencer.next_seq);
+        if let Some(data) = chunk_resp.data {
+            wc += write_chunk(dest, data).await?;
+        }
+        sequencer.advance();
+    }
+    Ok(wc)
+}
+
+// Completely write a chunk to dest
+async fn write_chunk<T: AsyncWrite + Unpin>(
+    dest: &mut T,
+    mut data: AggregatedBytes,
+) -> Result<usize, TransferError> {
+    let mut wc = 0;
+    while data.has_remaining() {
+        wc += dest
+            .write_buf(&mut data)
+            .await
+            .map_err(error::chunk_failed)?;
+    }
+    Ok(wc)
 }
 
 // Worker function that processes requests from the `requests` channel and
@@ -287,12 +327,16 @@ async fn chunk_downloader(
     completed: mpsc::Sender<Result<ChunkResponse, TransferError>>,
 ) {
     while let Ok(request) = requests.recv().await {
+        let seq = request.seq;
+        tracing::trace!("worker recv'd request for chunk seq {}", seq);
         let result = download_chunk(&handle, request).await;
         if let Err(err) = completed.send(result).await {
             tracing::debug!(error = ?err, "chunk worker send failed");
             return;
         }
+        tracing::trace!("worker completed chunk seq {}", seq);
     }
+    tracing::trace!("req channel closed, worker finished");
 }
 
 async fn download_chunk(
@@ -318,30 +362,33 @@ async fn download_chunk(
 }
 
 async fn distribute_work(
-    discovery: DiscoverResult,
+    remaining: RangeInclusive<u64>,
     input: GetObjectInputBuilder,
     part_size: u64,
     tx: async_channel::Sender<ChunkRequest>,
 ) {
-    let end = *discovery.remaining.end();
-    let mut pos = *discovery.remaining.start();
-    let mut remaining = end - pos;
-
-    // NOTE: start at 1 in case there was an initial chunk in discovery
-    let mut seq = 1;
+    let end = *remaining.end();
+    let mut pos = *remaining.start();
+    let mut remaining = end - pos + 1;
+    let mut seq = 0;
 
     while remaining > 0 {
         let start = pos;
         let end_inclusive = cmp::min(pos + part_size, end);
 
         let chunk_req = next_chunk(start, end_inclusive, seq, input.clone());
+        tracing::trace!("distributing chunk(size={}): {:?}", chunk_req.size(), chunk_req);
         let chunk_size = chunk_req.size();
         tx.send(chunk_req).await.expect("channel open");
 
         seq += 1;
         remaining -= chunk_size;
+        tracing::trace!("remaining = {}", remaining);
         pos += chunk_size;
     }
+
+    tracing::trace!("work fully distributed");
+    tx.close();
 }
 
 fn next_chunk(
@@ -353,4 +400,27 @@ fn next_chunk(
     let range = start..=end_inclusive;
     let input = input.range(Range::bytes_inclusive(start, end_inclusive));
     ChunkRequest { seq, range, input }
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_smithy_types::byte_stream::AggregatedBytes;
+
+    use crate::types::ChunkResponse;
+    use super::Sequencer;
+
+    fn chunk_resp(seq: u64, data: Option<AggregatedBytes>) -> ChunkResponse {
+        ChunkResponse { seq,  data, object_meta: None }
+    }
+
+    #[test]
+    fn test_sequencer() {
+        let mut sequencer = Sequencer::new();
+        sequencer.push(chunk_resp(1, None));
+        sequencer.push(chunk_resp(2, None));
+        assert_eq!(sequencer.peek().unwrap().seq, 1);
+        sequencer.push(chunk_resp(0, None));
+        assert_eq!(sequencer.pop().unwrap().seq, 0);
+    }
+
 }

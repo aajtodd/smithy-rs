@@ -26,7 +26,7 @@ pub(crate) const GIBI_BYTE: u64 = MEBI_BYTE * 1024;
 pub(crate) const MIN_PART_SIZE: u64 = 5 * MEBI_BYTE;
 
 
-mod types;
+pub mod types;
 mod header;
 mod object_meta;
 mod discovery;
