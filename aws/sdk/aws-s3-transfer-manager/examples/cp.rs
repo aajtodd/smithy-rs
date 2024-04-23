@@ -126,11 +126,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .content_length
         .expect("Content-Length available") as u64;
     let obj_size_gigabytes = obj_size as f64 / ONE_GIGABYTE as f64;
-    let throughput_gbps = obj_size_gigabytes / elapsed_secs;
+    let obj_size_gigabits = obj_size_gigabytes * 8.0;
 
     println!(
-        "downloaded {} bytes ({} GiB) in {} seconds; GiB/s: {}",
-        obj_size, obj_size_gigabytes, elapsed_secs, throughput_gbps
+        "downloaded {} bytes ({} GiB) in {} seconds; GiB/s: {}; Gbps: {}",
+        obj_size,
+        obj_size_gigabytes,
+        elapsed_secs,
+        obj_size_gigabytes / elapsed_secs,
+        obj_size_gigabits / elapsed_secs
     );
 
     Ok(())

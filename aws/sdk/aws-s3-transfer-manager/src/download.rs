@@ -13,6 +13,7 @@ use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
+use tracing::Instrument;
 
 use crate::{
     discovery::{discover_obj_size, DiscoverResult},
@@ -168,7 +169,8 @@ impl Downloader {
 
             // spin up workers
             for _ in 0..self.concurrency {
-                let worker = chunk_downloader(handle.clone(), work_rx.clone(), comp_tx.clone());
+                let worker = chunk_downloader(handle.clone(), work_rx.clone(), comp_tx.clone())
+                    .instrument(tracing::debug_span!("chunk-downloader"));
                 tokio::spawn(worker);
             }
         }
@@ -295,7 +297,12 @@ async fn write_remaining<T: AsyncWrite + Unpin>(
 ) -> Result<usize, TransferError> {
     let mut wc = 0;
     while let Some(chunk_resp) = sequencer.pop() {
-        debug_assert!(chunk_resp.seq == sequencer.next_seq, "chunk seq={}; next expected={}", chunk_resp.seq, sequencer.next_seq);
+        debug_assert!(
+            chunk_resp.seq == sequencer.next_seq,
+            "chunk seq={}; next expected={}",
+            chunk_resp.seq,
+            sequencer.next_seq
+        );
         if let Some(data) = chunk_resp.data {
             wc += write_chunk(dest, data).await?;
         }
@@ -329,7 +336,10 @@ async fn chunk_downloader(
     while let Ok(request) = requests.recv().await {
         let seq = request.seq;
         tracing::trace!("worker recv'd request for chunk seq {}", seq);
-        let result = download_chunk(&handle, request).await;
+        let result = download_chunk(&handle, request)
+            .instrument(tracing::debug_span!("download-chunk", seq = seq))
+            .await;
+
         if let Err(err) = completed.send(result).await {
             tracing::debug!(error = ?err, "chunk worker send failed");
             return;
@@ -349,7 +359,12 @@ async fn download_chunk(
         .await
         .map_err(error::chunk_failed)?;
 
-    let bytes = resp.body.collect().await.map_err(error::chunk_failed)?;
+    let bytes = resp
+        .body
+        .collect()
+        .instrument(tracing::debug_span!("collect-body", seq = request.seq))
+        .await
+        .map_err(error::chunk_failed)?;
 
     let resp = ChunkResponse {
         seq: request.seq,
@@ -377,7 +392,11 @@ async fn distribute_work(
         let end_inclusive = cmp::min(pos + part_size, end);
 
         let chunk_req = next_chunk(start, end_inclusive, seq, input.clone());
-        tracing::trace!("distributing chunk(size={}): {:?}", chunk_req.size(), chunk_req);
+        tracing::trace!(
+            "distributing chunk(size={}): {:?}",
+            chunk_req.size(),
+            chunk_req
+        );
         let chunk_size = chunk_req.size();
         tx.send(chunk_req).await.expect("channel open");
 
@@ -406,11 +425,15 @@ fn next_chunk(
 mod tests {
     use aws_smithy_types::byte_stream::AggregatedBytes;
 
-    use crate::types::ChunkResponse;
     use super::Sequencer;
+    use crate::types::ChunkResponse;
 
     fn chunk_resp(seq: u64, data: Option<AggregatedBytes>) -> ChunkResponse {
-        ChunkResponse { seq,  data, object_meta: None }
+        ChunkResponse {
+            seq,
+            data,
+            object_meta: None,
+        }
     }
 
     #[test]
@@ -422,5 +445,4 @@ mod tests {
         sequencer.push(chunk_resp(0, None));
         assert_eq!(sequencer.pop().unwrap().seq, 0);
     }
-
 }
